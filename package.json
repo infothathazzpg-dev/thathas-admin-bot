@@ -1,0 +1,12 @@
+{
+  "name": "thathas-admin-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram admin bot for the Thathas Stay website (Supabase). Zero dependencies.",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/run.js"
+  }
+}

@@ -1,0 +1,20 @@
+# Render Blueprint — optional. You can also create the service by hand (see README).
+services:
+  - type: web
+    name: thathas-admin-bot
+    runtime: node
+    plan: free
+    buildCommand: "echo no build needed"
+    startCommand: node src/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
