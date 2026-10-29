@@ -1,7 +1,8 @@
 import {
   btn, urlBtn, kb, inr, clip, todayIST, monthStartIST, monthLabel, waLink,
-  ENQ, ROOM, ROOM_EMOJI, enquiryCard, reviewCard, roomCard,
+  ENQ, ROOM, ROOM_EMOJI, enquiryCard, reviewCard, roomCard, pagerRows,
 } from "./ui.js";
+import { createPublic } from "./public.js";
 
 const HELP = [
   "🤖 Thathas Stay admin bot",
@@ -29,6 +30,7 @@ export function createHandlers({ tg, db, cfg, log = console }) {
       [btn("🔔 Enquiries", "m:enq"), btn("⭐ Reviews", "m:rev")],
       [btn("🏠 Rooms", "m:rooms"), btn("💰 Rent", "m:rent")],
       [btn("🔍 Search", "m:find"), btn("❓ Help", "m:help")],
+      [btn("👀 Public view", "u:menu")],
     ]),
   });
 
@@ -138,12 +140,23 @@ export function createHandlers({ tg, db, cfg, log = console }) {
     };
   }
 
-  // ── sending helpers ────────────────────────────────────────
-  async function sendView(chatId, view) {
-    return tg.send(chatId, view.text, view.markup);
+  // ── one-message UI helpers ─────────────────────────────────
+  // panels: chatId -> message id of the live panel, so a typed command replaces the old panel instead of stacking messages
+  const panels = new Map();
+  const del = (chatId, messageId) => tg.call("deleteMessage", { chat_id: chatId, message_id: messageId }).catch(() => {});
+
+  /** Typed command: remove the user's command + the old panel, post ONE fresh panel at the bottom. */
+  async function openView(chatId, view, userMsgId) {
+    const old = panels.get(chatId);
+    if (old) await del(chatId, old);
+    if (userMsgId) await del(chatId, userMsgId);
+    const sent = await tg.send(chatId, view.text, view.markup);
+    panels.set(chatId, sent.message_id);
+    return sent.message_id;
   }
 
-  async function showView(msg, fallbackChatId, view) {
+  /** Button tap: edit the message in place (falls back to a new message if it can't be edited). */
+  async function showView(msg, fallbackChatId, view, onNew) {
     if (msg && msg.chat && msg.message_id) {
       try {
         await tg.edit(msg.chat.id, msg.message_id, view.text, view.markup);
@@ -152,27 +165,49 @@ export function createHandlers({ tg, db, cfg, log = console }) {
         log.warn?.("edit failed, sending new message:", e.message);
       }
     }
-    await tg.send(msg?.chat?.id ?? fallbackChatId, view.text, view.markup);
+    const sent = await tg.send(msg?.chat?.id ?? fallbackChatId, view.text, view.markup);
+    if (onNew) onNew(sent.message_id);
+    panels.set(msg?.chat?.id ?? fallbackChatId, sent.message_id);
   }
 
-  async function sendEnquiryCards(chatId, code = "n") {
-    const a = ENQ[code] || ENQ.n;
-    const rows = await db.select("enquiries", { filters: [["status", "eq", a.status]], order: "created_at.desc", limit: 5 });
-    if (!rows.length) return tg.send(chatId, `No ${a.status === "closed" ? "rejected" : a.status} enquiries 🎉`);
-    for (const e of rows.reverse()) {
-      const c = enquiryCard(e);
-      await tg.send(chatId, c.text, c.markup);
-    }
+  const textView = (text) => ({ text, markup: kb([[btn("🏠 Menu", "m:main")]]) });
+
+  // ── pagers: one enquiry / review per message ───────────────
+  const ENQ_FILTER_NAME = { n: "new", c: "contacted", v: "converted", x: "rejected" };
+  const enqList = (f) => db.select("enquiries", { filters: [["status", "eq", (ENQ[f] || ENQ.n).status]], order: "created_at.desc", limit: 100 });
+  const revList = () => db.select("testimonials", { filters: [["approved", "eq", "false"]], order: "created_at.desc", limit: 100 });
+  const enqBack = [{ text: "📋 Lists", data: "m:enq" }, { text: "🏠 Menu", data: "m:main" }];
+  const revBack = [{ text: "🏠 Menu", data: "m:main" }];
+
+  async function enquiryViewer(f, i) {
+    const list = await enqList(f);
+    if (!list.length) return { text: `No ${ENQ_FILTER_NAME[f] || "new"} enquiries 🎉`, markup: kb([enqBack.map((b) => btn(b.text, b.data))]) };
+    const idx = Math.min(Math.max(0, i), list.length - 1);
+    return enquiryCard(list[idx], pagerRows(list, list[idx].id, idx, (n) => `qv:${f}:${n}`, enqBack, `${f}:`));
+  }
+  async function enquiryAfterAction(f, i, row) {
+    const list = await enqList(f);
+    return enquiryCard(row, pagerRows(list, row.id, i, (n) => `qv:${f}:${n}`, enqBack, `${f}:`));
+  }
+  async function reviewViewer(i) {
+    const list = await revList();
+    if (!list.length) return { text: "No reviews waiting for approval 🎉", markup: kb([revBack.map((b) => btn(b.text, b.data))]) };
+    const idx = Math.min(Math.max(0, i), list.length - 1);
+    return reviewCard(list[idx], { nav: pagerRows(list, list[idx].id, idx, (n) => `rv:${n}`, revBack) });
+  }
+  async function reviewAfterAction(i, row, deleted) {
+    const list = await revList();
+    return reviewCard(row, { deleted, nav: pagerRows(list, row.id, i, (n) => `rv:${n}`, revBack) });
   }
 
-  async function sendReviewCards(chatId) {
-    const rows = await db.select("testimonials", { filters: [["approved", "eq", "false"]], order: "created_at.desc", limit: 5 });
-    if (!rows.length) return tg.send(chatId, "No reviews waiting for approval 🎉");
-    for (const t of rows.reverse()) {
-      const c = reviewCard(t);
-      await tg.send(chatId, c.text, c.markup);
-    }
+  /** New public enquiry → alert channel (or DMs to admins) with action buttons. */
+  async function notifyNewEnquiry(row) {
+    const c = enquiryCard(row);
+    const targets = cfg.alertChatId ? [cfg.alertChatId] : cfg.admins;
+    for (const t of targets) await tg.send(t, c.text, c.markup).catch((e) => log.warn?.("alert failed:", e.message));
   }
+
+  const pub = createPublic({ tg, db, cfg, log, openView, showView, notifyNewEnquiry });
 
   // ── actions ────────────────────────────────────────────────
   async function setRoomStatus(id, code) {
@@ -201,13 +236,16 @@ export function createHandlers({ tg, db, cfg, log = console }) {
 
   // ── callbacks (button taps) ────────────────────────────────
   async function onCallback(cq) {
+    const kind0 = String(cq.data || "").split(":")[0];
+    if (kind0 === "u") return pub.onCallback(cq); // public menu: open to everyone
     if (!isAdmin(cq.from?.id)) {
-      await tg.answer(cq.id, "⛔ You are not an admin of this bot.", true).catch(() => {});
+      await tg.answer(cq.id, "⛔ This button is for admins only.", true).catch(() => {});
       return;
     }
     const msg = cq.message;
     const chatId = msg?.chat?.id ?? cq.from.id;
-    const [kind, a, b] = String(cq.data || "").split(":");
+    if (msg?.chat?.id === cq.from.id) panels.set(chatId, msg.message_id); // private chat: remember the live panel
+    const [kind, a, b, c3, c4] = String(cq.data || "").split(":");
 
     try {
       switch (kind) {
@@ -221,15 +259,23 @@ export function createHandlers({ tg, db, cfg, log = console }) {
           if (a === "enq") return await showView(msg, chatId, await enquiryMenuView());
           if (a === "rooms") return await showView(msg, chatId, await roomsView(0));
           if (a === "rent") return await showView(msg, chatId, await rentView("p"));
-          if (a === "rev") return await sendReviewCards(chatId);
-          if (a === "find") return await tg.send(chatId, "🔍 Send:  /find <name or phone>\nExample: /find fathima");
-          if (a === "help") return await tg.send(chatId, HELP);
+          if (a === "rev") return await showView(msg, chatId, await reviewViewer(0));
+          if (a === "find") return await showView(msg, chatId, textView("🔍 Search\n\nSend:  /find <name or phone>\nExample: /find fathima"));
+          if (a === "help") return await showView(msg, chatId, textView(HELP));
           return;
         }
 
         case "q":
           await tg.answer(cq.id);
-          return await sendEnquiryCards(chatId, a);
+          return await showView(msg, chatId, await enquiryViewer(a, 0));
+
+        case "qv":
+          await tg.answer(cq.id);
+          return await showView(msg, chatId, await enquiryViewer(a, Number(b) || 0));
+
+        case "rv":
+          await tg.answer(cq.id);
+          return await showView(msg, chatId, await reviewViewer(Number(a) || 0));
 
         case "e": {
           const info = ENQ[b];
@@ -237,21 +283,23 @@ export function createHandlers({ tg, db, cfg, log = console }) {
           const rows = await db.update("enquiries", [["id", "eq", a]], { status: info.status });
           if (!rows[0]) return await tg.answer(cq.id, "Enquiry not found (deleted?)", true);
           await tg.answer(cq.id, info.label);
-          const c = enquiryCard(rows[0]);
-          return await showView(msg, chatId, c);
+          const view = c3 !== undefined ? await enquiryAfterAction(c3, Number(c4) || 0, rows[0]) : enquiryCard(rows[0]);
+          return await showView(msg, chatId, view);
         }
 
         case "r": {
+          const idx = c3 !== undefined ? Number(c3) || 0 : undefined;
           if (b === "d") {
             const rows = await db.delete("testimonials", [["id", "eq", a]]);
             await tg.answer(cq.id, "🗑 Rejected");
-            return await showView(msg, chatId, reviewCard(rows[0] || { id: a, name: "(deleted)", review: "" }, { deleted: true }));
+            const row = rows[0] || { id: a, name: "(deleted)", review: "" };
+            return await showView(msg, chatId, idx !== undefined ? await reviewAfterAction(idx, row, true) : reviewCard(row, { deleted: true }));
           }
           const approved = b === "a";
           const rows = await db.update("testimonials", [["id", "eq", a]], { approved });
           if (!rows[0]) return await tg.answer(cq.id, "Review not found", true);
           await tg.answer(cq.id, approved ? "✅ Approved — now live" : "↩ Hidden from website");
-          return await showView(msg, chatId, reviewCard(rows[0]));
+          return await showView(msg, chatId, idx !== undefined ? await reviewAfterAction(idx, rows[0], false) : reviewCard(rows[0]));
         }
 
         case "rl":
@@ -307,62 +355,63 @@ export function createHandlers({ tg, db, cfg, log = console }) {
     const text = (m.text || "").trim();
     const chatId = m.chat.id;
     if (!isAdmin(m.from?.id)) {
-      if (text.startsWith("/")) await tg.send(chatId, `⛔ Not authorised.\nYour Telegram user id is ${m.from?.id}.\nAsk the owner to add it to ADMIN_IDS.`).catch(() => {});
-      return;
+      if (m.chat.type === "private") return pub.onMessage(m); // public visitors get the friendly menu
+      return; // ignore strangers in groups
     }
     if (!text.startsWith("/")) {
-      if (m.chat.type === "private") await sendView(chatId, mainView());
+      if (m.chat.type === "private") await openView(chatId, mainView(), m.message_id);
       return;
     }
     const parts = text.split(/\s+/);
     const cmd = parts[0].split("@")[0].toLowerCase();
     const args = parts.slice(1);
+    const open = (view) => openView(chatId, view, m.message_id);
 
     try {
       switch (cmd) {
         case "/start":
         case "/menu":
-          return void (await sendView(chatId, mainView()));
+          return void (await open(mainView()));
         case "/help":
-          return void (await tg.send(chatId, HELP));
+          return void (await open(textView(HELP)));
         case "/stats":
-          return void (await sendView(chatId, await statsView()));
+          return void (await open(await statsView()));
         case "/enquiries":
-          return void (await sendEnquiryCards(chatId, "n"));
+          return void (await open(await enquiryViewer("n", 0)));
         case "/reviews":
-          return void (await sendReviewCards(chatId));
+          return void (await open(await reviewViewer(0)));
         case "/rooms":
-          return void (await sendView(chatId, await roomsView(0)));
+          return void (await open(await roomsView(0)));
         case "/due":
         case "/rent":
-          return void (await sendView(chatId, await rentView("p")));
+          return void (await open(await rentView("p")));
 
         case "/paid": {
           const q = args.join(" ").trim().toLowerCase();
-          if (!q) return void (await tg.send(chatId, "Usage: /paid <tenant name or room>"));
+          if (!q) return void (await open(textView("Usage: /paid <tenant name or room>")));
           const ts = await db.select("tenants", { columns: "id,name,room", filters: [["status", "eq", "active"]] });
           const hits = ts.filter((t) => (t.name || "").toLowerCase().includes(q) || String(t.room || "").toLowerCase() === q.replace(/^r/, ""));
-          if (!hits.length) return void (await tg.send(chatId, `No active tenant matches "${q}".`));
-          if (hits.length > 1) return void (await tg.send(chatId, "Be more specific:\n" + hits.slice(0, 8).map((t) => `• ${t.name}${t.room ? " (R" + t.room + ")" : ""}`).join("\n")));
+          if (!hits.length) return void (await open(textView(`No active tenant matches "${q}".`)));
+          if (hits.length > 1) return void (await open(textView("Be more specific:\n" + hits.slice(0, 8).map((t) => `• ${t.name}${t.room ? " (R" + t.room + ")" : ""}`).join("\n"))));
           const res = await setRent(hits[0].id, true);
-          return void (await tg.send(chatId, `✅ ${res.tenant.name}: ${inr(res.amount)} marked paid`));
+          return void (await open(textView(`✅ ${res.tenant.name}: ${inr(res.amount)} marked paid`)));
         }
 
         case "/room": {
           const num = (args[0] || "").toLowerCase().replace(/^r/, "");
           const code = Object.keys(ROOM).find((c) => ROOM[c].status === (args[1] || "").toLowerCase());
-          if (!num || !code) return void (await tg.send(chatId, "Usage: /room <number> <status>\nstatus: " + Object.values(ROOM).map((r) => r.status).join(", ")));
+          if (!num || !code) return void (await open(textView("Usage: /room <number> <status>\nstatus: " + Object.values(ROOM).map((r) => r.status).join(", "))));
           const rooms = await db.select("rooms", { columns: "id,room_number" });
           const hits = rooms.filter((r) => String(r.room_number).toLowerCase().replace(/^r/, "") === num);
-          if (!hits.length) return void (await tg.send(chatId, `Room "${args[0]}" not found.`));
-          if (hits.length > 1) return void (await tg.send(chatId, "That room number exists in more than one branch — use /rooms."));
+          if (!hits.length) return void (await open(textView(`Room "${args[0]}" not found.`)));
+          if (hits.length > 1) return void (await open(textView("That room number exists in more than one branch — use /rooms.")));
           const r = await setRoomStatus(hits[0].id, code);
-          return void (await tg.send(chatId, r ? `✅ Room ${r.room_number} → ${r.status}` : "❌ Update failed."));
+          return void (await open(r ? roomCard(r) : textView("❌ Update failed.")));
         }
 
         case "/find": {
           const q = args.join(" ").trim().toLowerCase();
-          if (q.length < 3) return void (await tg.send(chatId, "Usage: /find <at least 3 letters or digits>"));
+          if (q.length < 3) return void (await open(textView("Usage: /find <at least 3 letters or digits>")));
           const digits = q.replace(/\D/g, "");
           const match = (x) => (x.name || "").toLowerCase().includes(q) || (digits.length >= 4 && String(x.phone || "").replace(/\D/g, "").includes(digits));
           const [enq, ten] = await Promise.all([
@@ -371,19 +420,19 @@ export function createHandlers({ tg, db, cfg, log = console }) {
           ]);
           const he = enq.filter(match);
           const ht = ten.filter(match);
-          if (!he.length && !ht.length) return void (await tg.send(chatId, `Nothing found for "${q}".`));
+          if (!he.length && !ht.length) return void (await open(textView(`Nothing found for "${q}".`)));
           const out = [];
           if (ht.length) out.push("🧑 Tenants", ...ht.slice(0, 6).map((x) => `• ${x.name}${x.room ? " (R" + x.room + ")" : ""} — ${x.phone} — ${x.status}`));
           if (he.length) out.push("🔔 Enquiries", ...he.slice(0, 6).map((x) => `• ${x.name} — ${x.phone} — ${x.status} — ${x.location || "-"}`));
-          return void (await tg.send(chatId, out.join("\n")));
+          return void (await open(textView(out.join("\n"))));
         }
 
         default:
-          return void (await tg.send(chatId, "Unknown command. Send /menu or /help"));
+          return void (await open(textView("Unknown command. Send /menu or /help")));
       }
     } catch (e) {
       log.error?.("command error:", e.message);
-      await tg.send(chatId, "❌ " + clip(e.message, 150)).catch(() => {});
+      await open(textView("❌ " + clip(e.message, 150))).catch(() => {});
     }
   }
 

@@ -35,6 +35,12 @@ const seed = () => ({
   ],
   rent_payments: [],
   room_status_history: [],
+  facilities: [{ id: "f1", name: "Free WiFi", description: "High-speed", active: true, created_at: "2026-01-01" }],
+  faqs: [
+    { id: "q1", question: "Is WiFi free?", answer: "Yes, included.", order: 1 },
+    { id: "q2", question: "Notice period?", answer: "30 days.", order: 2 },
+  ],
+  locations: [{ id: "l1", name: "Malaparamba", address: "Majestic Building, Malaparamba", latitude: 11.2588, longitude: 75.7804, active: true, created_at: "2026-01-01" }],
 });
 
 let passed = 0;
@@ -60,6 +66,7 @@ const cfg = {
   admins: [String(ADMIN)],
   port: 0,
   pollTimeout: 1,
+  alertChatId: "-1001234",
 };
 const quiet = { log() {}, warn() {}, error: (...a) => console.log("   [bot error]", ...a) };
 
@@ -90,15 +97,22 @@ await test("health endpoint answers 200", async () => {
 });
 
 console.log("Security");
-await test("non-admin command is refused and shows their id", async () => {
+await test("non-admin typing an admin command gets the public welcome — no admin data", async () => {
   text(999, 999, "/stats");
-  const m = await waitFor(() => tgm.of("sendMessage").find((p) => p.chat_id === 999), "refusal");
-  assert.match(m.text, /Not authorised/);
-  assert.match(m.text, /999/);
+  const m = await waitFor(() => tgm.of("sendMessage").find((p) => p.chat_id === 999), "welcome");
+  assert.match(m.text, /Welcome to Thathas Stay/);
+  assert.doesNotMatch(m.text, /Active tenants|Dashboard/);
+  assert.ok(find(m.reply_markup, "Enquire"));
 });
-await test("non-admin button tap is refused and changes nothing", async () => {
+await test("non-admin in a group chat is ignored", async () => {
+  const n = tgm.of("sendMessage").length;
+  tgm.push({ message: { message_id: 3, chat: { id: -500, type: "group" }, from: { id: 999 }, text: "/stats" } });
+  await sleep(250);
+  assert.equal(tgm.of("sendMessage").length, n);
+});
+await test("non-admin tapping an admin button is refused and changes nothing", async () => {
   tap(999, "e:enq-1:x");
-  const a = await waitFor(() => tgm.of("answerCallbackQuery").find((p) => /not an admin/.test(p.text)), "alert");
+  const a = await waitFor(() => tgm.of("answerCallbackQuery").find((p) => /admins only/.test(p.text)), "alert");
   assert.equal(a.show_alert, true);
   assert.equal(sb.st.tables.enquiries[0].status, "new");
 });
@@ -180,8 +194,9 @@ await test("unknown enquiry id gives an alert, no crash", async () => {
 
 console.log("Reviews");
 await test("pending review card: Approve green, Reject red", async () => {
+  const n = tgm.of("editMessageText").length;
   tap(ADMIN, "m:rev");
-  const m = await waitFor(() => tgm.of("sendMessage").find((p) => /waiting for approval/.test(p.text)), "review card");
+  const m = await waitFor(() => tgm.of("editMessageText").slice(n).find((p) => /waiting for approval/.test(p.text)), "review card");
   assert.equal(find(m.reply_markup, "Approve").style, "success");
   assert.equal(find(m.reply_markup, "Reject").style, "danger");
 });
@@ -243,7 +258,7 @@ await test("beds +/- stay within 0..occupancy", async () => {
 });
 await test("/room 102 available (typed command)", async () => {
   text(ADMIN, ADMIN, "/room 102 available");
-  await waitFor(() => tgm.of("sendMessage").some((p) => /Room R102 → available/.test(p.text)), "reply");
+  await waitFor(() => tgm.of("sendMessage").some((p) => /Room R102/.test(p.text) && /Status: 🟢 available/.test(p.text)), "reply");
   assert.equal(sb.st.tables.rooms[1].status, "available");
 });
 
@@ -302,6 +317,166 @@ await test("callback data from the website's alert (same format) works", async (
   // website cards use e:<id>:c|v|x and r:<id>:a|d — already covered above; here: stale message without message object
   tgm.push({ callback_query: { id: "cbx", from: { id: ADMIN }, data: "e:enq-1:v" } });
   await waitFor(() => sb.st.tables.enquiries[0].status === "converted", "converted");
+});
+
+console.log("One-message UI");
+await test("typed commands delete the user's message and the previous panel (no stacking)", async () => {
+  const before = tgm.of("deleteMessage").length;
+  tgm.push({ message: { message_id: 901, chat: { id: ADMIN, type: "private" }, from: { id: ADMIN }, text: "/stats" } });
+  await waitFor(() => tgm.of("deleteMessage").some((d) => d.message_id === 901), "user msg deleted");
+  assert.ok(tgm.of("deleteMessage").length - before >= 1);
+  tgm.push({ message: { message_id: 902, chat: { id: ADMIN, type: "private" }, from: { id: ADMIN }, text: "/rooms" } });
+  await waitFor(() => tgm.of("deleteMessage").some((d) => d.message_id === 902), "second user msg deleted");
+  const dels = tgm.of("deleteMessage").filter((d) => d.chat_id === ADMIN);
+  assert.ok(dels.length >= 3, "old panel + both command messages removed, got " + dels.length);
+});
+await test("pager: 2 enquiries → one message, Next/Prev edit it, counter shown", async () => {
+  sb.st.tables.enquiries.push({ id: "enq-2", name: "Meera", phone: "9746000005", location: "Malaparamba", room_type: "single", message: "Hi", source: "website", status: "new", created_at: "2026-10-27T10:00:00Z" });
+  sb.st.tables.enquiries.find((e) => e.id === "enq-1").status = "new";
+  const n = tgm.of("editMessageText").length;
+  tap(ADMIN, "q:n");
+  await waitFor(() => tgm.of("editMessageText").length > n, "viewer");
+  assert.match(lastEdit().text, /Fathima/);          // newest first
+  assert.ok(find(lastEdit().reply_markup, "1/2"));
+  assert.ok(find(lastEdit().reply_markup, "Next ›"));
+  assert.equal(find(lastEdit().reply_markup, "‹ Prev"), undefined);
+  const sends = tgm.of("sendMessage").length;
+  tap(ADMIN, find(lastEdit().reply_markup, "Next ›").callback_data);
+  await waitFor(() => /Meera/.test(lastEdit().text), "second");
+  assert.ok(find(lastEdit().reply_markup, "2/2"));
+  assert.ok(find(lastEdit().reply_markup, "‹ Prev"));
+  assert.equal(find(lastEdit().reply_markup, "Next ›"), undefined);
+  assert.equal(tgm.of("sendMessage").length, sends, "navigation must edit, not send");
+});
+await test("pager action: Contacted on Meera shows blue result, list shrinks to '1 left'", async () => {
+  const cb = find(lastEdit().reply_markup, "Contacted").callback_data;
+  assert.match(cb, /^e:enq-2:c:n:1$/);
+  tap(ADMIN, cb);
+  await waitFor(() => sb.st.tables.enquiries.find((e) => e.id === "enq-2").status === "contacted", "db");
+  await waitFor(() => /Status: ✅ Contacted/.test(lastEdit().text), "edit");
+  assert.equal(find(lastEdit().reply_markup, "Contacted").style, "primary");
+  assert.ok(find(lastEdit().reply_markup, "1 left"));
+  assert.ok(find(lastEdit().reply_markup, "‹ Prev"), "can step back to the remaining enquiry");
+});
+await test("review pager: Approve keeps one message, shows green result", async () => {
+  sb.st.tables.testimonials.push({ id: "rev-9", name: "Sneha", review: "Lovely", rating: 5, approved: false, created_at: "2026-10-29T09:00:00Z" });
+  tap(ADMIN, "m:rev");
+  await waitFor(() => /Sneha/.test(lastEdit().text), "review viewer");
+  const cb = find(lastEdit().reply_markup, "Approve").callback_data;
+  assert.match(cb, /^r:rev-9:a:0$/);
+  const sends = tgm.of("sendMessage").length;
+  tap(ADMIN, cb);
+  await waitFor(() => sb.st.tables.testimonials.find((t) => t.id === "rev-9").approved === true, "approved");
+  await waitFor(() => find(lastEdit().reply_markup, "● ✅ Approved"), "green");
+  assert.equal(find(lastEdit().reply_markup, "Approved").style, "success");
+  assert.equal(tgm.of("sendMessage").length, sends);
+});
+
+console.log("Public contact UI (non-admins)");
+const VISITOR = 4242;
+const vtext = (t, id = 1000) => tgm.push({ message: { message_id: id, chat: { id: VISITOR, type: "private" }, from: { id: VISITOR, first_name: "Asha", username: "asha" }, text: t } });
+const vtap = (data, msgId = 700) => tgm.push({ callback_query: { id: "v" + Math.random(), from: { id: VISITOR, first_name: "Asha", username: "asha" }, message: { message_id: msgId, chat: { id: VISITOR } }, data } });
+await test("/start shows the public menu with Enquire (blue), rooms, facilities, location, rules, FAQs, WhatsApp", async () => {
+  vtext("/start", 1001);
+  const m = await waitFor(() => tgm.of("sendMessage").find((p) => p.chat_id === VISITOR && /Welcome to Thathas Stay/.test(p.text)), "welcome");
+  assert.equal(find(m.reply_markup, "Enquire").style, "primary");
+  for (const l of ["Rooms & prices", "Facilities", "Location", "Rules", "FAQs"]) assert.ok(find(m.reply_markup, l), l);
+  assert.ok(flat(m.reply_markup).some((b) => b.url && b.url.startsWith("https://wa.me/919746254533")));
+  assert.ok(tgm.of("deleteMessage").some((d) => d.chat_id === VISITOR && d.message_id === 1001), "user's /start removed");
+});
+await test("info screens edit the same message: rooms, facilities, location, rules, FAQ", async () => {
+  const sends = tgm.of("sendMessage").length;
+  for (const [data, rx] of [["u:rooms", /Single room — from ₹5,500\/bed/], ["u:fac", /Free WiFi/], ["u:loc", /Majestic Building/], ["u:rules", /No alcohol/], ["u:faq", /Is WiFi free/]]) {
+    const n = tgm.of("editMessageText").length;
+    vtap(data);
+    await waitFor(() => tgm.of("editMessageText").length > n, data);
+    assert.match(lastEdit().text + JSON.stringify(lastEdit().reply_markup), rx, data);
+  }
+  vtap("u:fq:0");
+  await waitFor(() => /Yes, included/.test(lastEdit().text), "faq answer");
+  assert.ok(find(lastEdit().reply_markup, "All FAQs"));
+  assert.equal(tgm.of("sendMessage").length, sends, "no extra messages");
+});
+await test("location screen has a Maps link built from the database coordinates", async () => {
+  vtap("u:loc");
+  await waitFor(() => /Majestic/.test(lastEdit().text), "loc");
+  assert.ok(flat(lastEdit().reply_markup).some((b) => b.url === "https://www.google.com/maps/search/?api=1&query=11.2588,75.7804"));
+});
+await test("enquiry flow — step 1 name (edits the menu message)", async () => {
+  vtap("u:enq");
+  await waitFor(() => /step 1\/4/.test(lastEdit().text), "step1");
+  assert.equal(find(lastEdit().reply_markup, "Cancel").style, "danger");
+  vtext("Asha Nair", 1002);
+  await waitFor(() => /step 2\/4/.test(lastEdit().text), "step2");
+  assert.match(lastEdit().text, /Asha Nair/);
+  assert.ok(tgm.of("deleteMessage").some((d) => d.message_id === 1002), "typed answer removed to keep one clean message");
+});
+await test("step 2 rejects a bad phone, accepts +91 format", async () => {
+  vtext("12345", 1003);
+  await waitFor(() => /valid 10-digit/.test(lastEdit().text), "warning");
+  vtext("+91 97460-12345", 1004);
+  await waitFor(() => /step 3\/4/.test(lastEdit().text), "step3");
+});
+await test("step 3 room type → step 4 → note → confirm summary with green Submit", async () => {
+  assert.ok(find(lastEdit().reply_markup, "Double"));
+  vtap("u:rt:double");
+  await waitFor(() => /step 4\/4/.test(lastEdit().text), "step4");
+  vtext("Joining next month, studying nursing", 1005);
+  await waitFor(() => /Please confirm/.test(lastEdit().text), "confirm");
+  assert.match(lastEdit().text, /9746012345/);
+  assert.match(lastEdit().text, /Double sharing/);
+  assert.match(lastEdit().text, /nursing/);
+  assert.equal(find(lastEdit().reply_markup, "Submit").style, "success");
+});
+await test("Submit → saved to Supabase (source telegram), alert posted with colour buttons, thank-you edits the message", async () => {
+  const sends = tgm.of("sendMessage").length;
+  vtap("u:submit");
+  await waitFor(() => sb.st.tables.enquiries.some((e) => e.source === "telegram"), "db row");
+  const row = sb.st.tables.enquiries.find((e) => e.source === "telegram");
+  assert.deepEqual([row.name, row.phone, row.room_type, row.status, row.location], ["Asha Nair", "9746012345", "double", "new", "Malaparamba"]);
+  assert.match(row.message, /nursing .*\[via Telegram @asha\]/);
+  const alert = await waitFor(() => tgm.of("sendMessage").slice(sends).find((p) => String(p.chat_id) === "-1001234"), "channel alert");
+  assert.match(alert.text, /Asha Nair/);
+  assert.equal(find(alert.reply_markup, "Reject").style, "danger");
+  assert.equal(find(alert.reply_markup, "Converted").style, "success");
+  await waitFor(() => /Thank you, Asha Nair/.test(lastEdit().text), "thanks");
+  assert.ok(flat(lastEdit().reply_markup).some((b) => b.url && b.url.includes("wa.me")));
+});
+await test("an admin can act on the visitor's enquiry straight from the alert", async () => {
+  const id = sb.st.tables.enquiries.find((e) => e.source === "telegram").id;
+  tap(ADMIN, `e:${id}:c`, 321, -1001234);
+  await waitFor(() => sb.st.tables.enquiries.find((e) => e.id === id).status === "contacted", "contacted");
+});
+await test("anti-spam: the 4th enquiry within an hour is blocked", async () => {
+  const quick = async () => {
+    vtap("u:enq");
+    await waitFor(() => /step 1\/4/.test(lastEdit().text), "s1");
+    vtext("Asha", 2000 + Math.random());
+    await waitFor(() => /step 2\/4/.test(lastEdit().text), "s2");
+    vtext("9746012345", 2000 + Math.random());
+    await waitFor(() => /step 3\/4/.test(lastEdit().text), "s3");
+    vtap("u:rt:any");
+    await waitFor(() => /step 4\/4/.test(lastEdit().text), "s4");
+    vtap("u:skip");
+    await waitFor(() => /Please confirm/.test(lastEdit().text), "confirm");
+  };
+  for (let k = 0; k < 2; k++) {
+    await quick();
+    vtap("u:submit");
+    await waitFor(() => /Thank you/.test(lastEdit().text), "thanks " + k);
+  }
+  assert.equal(sb.st.tables.enquiries.filter((e) => e.source === "telegram").length, 3);
+  await quick();
+  const n = tgm.of("answerCallbackQuery").length;
+  vtap("u:submit");
+  await waitFor(() => tgm.of("answerCallbackQuery").slice(n).some((a) => /a few enquiries already/.test(a.text)), "blocked");
+  assert.equal(sb.st.tables.enquiries.filter((e) => e.source === "telegram").length, 3);
+});
+await test("Cancel returns to the public menu; stale step buttons are handled", async () => {
+  vtap("u:cancel");
+  await waitFor(() => /Welcome to Thathas Stay/.test(lastEdit().text), "menu");
+  vtap("u:rt:single");
+  await waitFor(() => tgm.of("answerCallbackQuery").some((a) => /expired/.test(a.text || "")), "expired");
 });
 
 console.log("Resilience");

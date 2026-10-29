@@ -18,3 +18,5 @@ services:
         sync: false
       - key: ADMIN_IDS
         sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

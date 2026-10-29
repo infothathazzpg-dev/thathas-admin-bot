@@ -14,6 +14,14 @@ export function loadConfig(env = process.env) {
     pollTimeout: Number(env.POLL_TIMEOUT) || 25,
     notifyOnStart: env.NOTIFY_ON_START === "true",
     siteName: env.SITE_NAME || "Thathas Stay",
+    siteUrl: (env.SITE_URL || "https://thathazzpg.in").replace(/\/$/, ""),
+    phone: env.PG_PHONE || "+91 97462 54533",
+    waNumber: (env.WA_NUMBER || "919746254533").replace(/\D/g, ""),
+    address: env.PG_ADDRESS || "Majestic Building, Malaparamba, Calicut, Kerala 673009 (Opp. Cake Studio)",
+    lat: env.PG_LAT || "11.2588",
+    lng: env.PG_LNG || "75.7804",
+    // where enquiries made through the bot are announced (same value as TELEGRAM_CHAT_ID on the website); falls back to admin DMs
+    alertChatId: env.ALERT_CHAT_ID || env.TELEGRAM_CHAT_ID || "",
   };
 }
 

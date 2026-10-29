@@ -15,12 +15,24 @@ enquiries, reviews, rooms, rent. Colour-coded buttons: 🟦 primary · 🟩 succ
 
 Only Telegram user IDs in `ADMIN_IDS` can use it. Everyone else is refused (and told their ID).
 
+## One message, edited in place
+Every button tap **edits the same message** — nothing stacks up. Typing a command (e.g. `/stats`) removes your command and the old
+panel and posts one fresh panel. Enquiries and reviews open as a pager (‹ Prev · 2/5 · Next ›) inside one message.
+
+## Public visitors (non-admins)
+Anyone who messages the bot gets a friendly menu instead of "not authorised": 📝 Enquire / Book a room · 🏠 Rooms & prices
+(live from your database) · ✨ Facilities · 📍 Location (+ Maps) · 📜 Rules · ❓ FAQs · 💬 WhatsApp.
+**Enquire** is a 4-step guided form (name → mobile → room type → note → confirm), all in one message that edits itself.
+It saves to the same `enquiries` table (source `telegram`) and posts a card with 🟦/🟩/🟥 buttons to your alert channel
+(set `TELEGRAM_CHAT_ID`, or it DMs the admins). Limits: 3 enquiries per visitor per hour. Visitors can never see admin data.
+Optional env: `PG_PHONE`, `PG_WA_NUMBER`, `PG_ADDRESS`, `PG_MAPS_URL`, `SITE_URL_PUBLIC`.
+
 ## Deploy on Render (free)
 1. Put this folder in a GitHub repo (or a sub-folder of one).
 2. Render → **New + → Web Service** → pick the repo.
    - Runtime **Node**, Build Command `echo ok` (nothing to install), Start Command `node src/index.js`, Instance **Free**.
    - Health Check Path: `/health`
-3. Environment variables: `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMIN_IDS`.
+3. Environment variables: `TELEGRAM_BOT_TOKEN`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `ADMIN_IDS`, and `TELEGRAM_CHAT_ID` (your alert channel, so public enquiries land there).
 4. Deploy. Logs should say `Bot @yourbot is running (polling)`.
 5. **Keep it awake (free plan):** Render sleeps free services after 15 min without web traffic. The bot pings itself
    every 10 min, but also add a free monitor at uptimerobot.com → HTTP(s) check on `https://YOUR-SERVICE.onrender.com/health`, every 5 min.
